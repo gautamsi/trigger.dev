@@ -296,9 +296,9 @@ class PlaywrightExtension implements BuildExtension {
      */
     instructions.push(`RUN npx playwright install --dry-run > /tmp/browser-info.txt`);
     this.options.browsers.forEach((browser) => {
-      const browserType = browser === "chromium" ? "chromium-headless-shell" : browser;
+      const browserType = this.options.headless && browser === "chromium" ? "chromium-headless-shell" : browser;
       instructions.push(
-        `RUN grep -A5 "browser: ${browserType}" /tmp/browser-info.txt > /tmp/${browser}-info.txt`,
+        `RUN grep -A5 -m1 "browser: ${browserType}" /tmp/browser-info.txt > /tmp/${browser}-info.txt`,
 
         `RUN INSTALL_DIR=$(grep "Install location:" /tmp/${browser}-info.txt | cut -d':' -f2- | xargs) && \
           DIR_NAME=$(basename "$INSTALL_DIR") && \
