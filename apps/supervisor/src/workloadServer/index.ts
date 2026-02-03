@@ -21,7 +21,8 @@ import {
   type WorkloadSuspendRunResponseBody,
 } from "@trigger.dev/core/v3/workers";
 import { HttpServer, type CheckpointClient } from "@trigger.dev/core/v3/serverOnly";
-import { type IncomingMessage } from "node:http";
+import { type IncomingMessage, type ServerResponse } from "node:http";
+import { type DequeuedMessage } from "@trigger.dev/core/v3";
 import { register } from "../metrics.js";
 import { env } from "../env.js";
 
@@ -53,11 +54,29 @@ type WorkloadServerEvents = {
   ];
 };
 
+type WarmStartConfig = {
+  enabled: boolean;
+  connectionTimeoutMs: number;
+  keepaliveMs: number;
+};
+
+interface WaitingRunner {
+  res: ServerResponse;
+  deploymentId: string;
+  deploymentVersion: string;
+  machineCpu: string;
+  machineMemory: string;
+  controllerId: string;
+  workerInstanceName: string;
+  connectedAt: number;
+}
+
 type WorkloadServerOptions = {
   port: number;
   host?: string;
   workerClient: SupervisorHttpClient;
   checkpointClient?: CheckpointClient;
+  warmStart?: WarmStartConfig;
 };
 
 export class WorkloadServer extends EventEmitter<WorkloadServerEvents> {
@@ -85,6 +104,10 @@ export class WorkloadServer extends EventEmitter<WorkloadServerEvents> {
 
   private readonly workerClient: SupervisorHttpClient;
 
+  // Warm start: map of deployment key -> waiting runners (FIFO)
+  private readonly warmStartConfig?: WarmStartConfig;
+  private readonly waitingRunners = new Map<string, WaitingRunner[]>();
+
   constructor(opts: WorkloadServerOptions) {
     super();
 
@@ -93,6 +116,7 @@ export class WorkloadServer extends EventEmitter<WorkloadServerEvents> {
 
     this.workerClient = opts.workerClient;
     this.checkpointClient = opts.checkpointClient;
+    this.warmStartConfig = opts.warmStart;
 
     this.httpServer = this.createHttpServer({ host, port });
     this.websocketServer = this.createWebsocketServer();
@@ -371,6 +395,93 @@ export class WorkloadServer extends EventEmitter<WorkloadServerEvents> {
         },
       });
 
+    // Warm start routes (only when embedded warm start is enabled)
+    if (this.warmStartConfig?.enabled) {
+      const warmStartLogger = this.logger.child({ component: "warm-start" });
+
+      // GET /connect — runner calls this first to get timeout config
+      httpServer.route("/connect", "GET", {
+        handler: async ({ reply }) => {
+          reply.json({
+            connectionTimeoutMs: this.warmStartConfig!.connectionTimeoutMs,
+            keepaliveMs: this.warmStartConfig!.keepaliveMs,
+          });
+        },
+      });
+
+      // GET /warm-start — runner long-polls here while idle
+      httpServer.route("/warm-start", "GET", {
+        keepConnectionAlive: true,
+        handler: async ({ req, res }) => {
+          const deploymentId = req.headers["x-trigger-deployment-id"] as string | undefined;
+          const deploymentVersion = req.headers["x-trigger-deployment-version"] as
+            | string
+            | undefined;
+          const controllerId = req.headers["x-trigger-workload-controller-id"] as
+            | string
+            | undefined;
+          const machineCpu = req.headers["x-trigger-machine-cpu"] as string | undefined;
+          const machineMemory = req.headers["x-trigger-machine-memory"] as string | undefined;
+          const workerInstanceName = req.headers["x-trigger-worker-instance-name"] as
+            | string
+            | undefined;
+
+          if (!deploymentId || !deploymentVersion || !controllerId) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Missing required headers" }));
+            return;
+          }
+
+          const runner: WaitingRunner = {
+            res,
+            deploymentId,
+            deploymentVersion,
+            machineCpu: machineCpu ?? "0",
+            machineMemory: machineMemory ?? "0",
+            controllerId,
+            workerInstanceName: workerInstanceName ?? "unknown",
+            connectedAt: Date.now(),
+          };
+
+          const key = this.warmStartKey(deploymentId, deploymentVersion);
+
+          warmStartLogger.log("Runner waiting for warm start", {
+            key,
+            controllerId,
+            workerInstanceName: runner.workerInstanceName,
+          });
+
+          // Add to waiting runners
+          const runners = this.waitingRunners.get(key) ?? [];
+          runners.push(runner);
+          this.waitingRunners.set(key, runners);
+
+          // Remove on client disconnect
+          req.on("close", () => {
+            this.removeWaitingRunner(key, runner);
+            warmStartLogger.debug("Runner disconnected from warm start poll", {
+              key,
+              controllerId,
+            });
+          });
+        },
+      });
+
+      // POST /warm-start — external caller pushes a dequeued message (for compatibility)
+      httpServer.route("/warm-start", "POST", {
+        bodySchema: z.object({ dequeuedMessage: z.record(z.unknown()) }),
+        handler: async ({ reply, body }) => {
+          if (!body.dequeuedMessage) {
+            reply.json({ didWarmStart: false }, false, 400);
+            return;
+          }
+
+          const didWarmStart = this.tryWarmStart(body.dequeuedMessage as unknown as DequeuedMessage);
+          reply.json({ didWarmStart });
+        },
+      });
+    }
+
     if (env.SEND_RUN_DEBUG_LOGS) {
       httpServer.route("/api/v1/workload-actions/runs/:runFriendlyId/logs/debug", "POST", {
         paramsSchema: WorkloadActionParams.pick({ runFriendlyId: true }),
@@ -554,6 +665,87 @@ export class WorkloadServer extends EventEmitter<WorkloadServerEvents> {
     });
 
     return websocketServer;
+  }
+
+  // --- Warm start matchmaking ---
+
+  private warmStartKey(deploymentId: string, deploymentVersion: string): string {
+    return `${deploymentId}:${deploymentVersion}`;
+  }
+
+  private removeWaitingRunner(key: string, runner: WaitingRunner) {
+    const runners = this.waitingRunners.get(key);
+    if (!runners) return;
+
+    const index = runners.indexOf(runner);
+    if (index !== -1) {
+      runners.splice(index, 1);
+    }
+    if (runners.length === 0) {
+      this.waitingRunners.delete(key);
+    }
+  }
+
+  /**
+   * Try to match a dequeued run to an idle runner waiting for warm start.
+   * Returns true if matched (the runner's long-poll response is sent with the message).
+   * Returns false if no idle runner is available.
+   */
+  tryWarmStart(dequeuedMessage: DequeuedMessage): boolean {
+    if (!this.warmStartConfig?.enabled) {
+      return false;
+    }
+
+    const deploymentId = dequeuedMessage.deployment.friendlyId;
+    const deploymentVersion = dequeuedMessage.backgroundWorker.version;
+
+    if (!deploymentId) {
+      return false;
+    }
+
+    const key = this.warmStartKey(deploymentId, deploymentVersion);
+    const runners = this.waitingRunners.get(key);
+
+    if (!runners || runners.length === 0) {
+      this.logger.debug("No idle runners for warm start", { key });
+      return false;
+    }
+
+    // FIFO: pick the first idle runner
+    const runner = runners.shift()!;
+    if (runners.length === 0) {
+      this.waitingRunners.delete(key);
+    }
+
+    this.logger.log("Warm start matched", {
+      key,
+      controllerId: runner.controllerId,
+      workerInstanceName: runner.workerInstanceName,
+      runId: dequeuedMessage.run.friendlyId,
+      waitDurationMs: Date.now() - runner.connectedAt,
+    });
+
+    // Send the dequeued message to the waiting runner's held response
+    try {
+      runner.res.writeHead(200, { "Content-Type": "application/json" });
+      runner.res.end(JSON.stringify(dequeuedMessage));
+      return true;
+    } catch (error) {
+      this.logger.error("Failed to send warm start message to runner", {
+        key,
+        controllerId: runner.controllerId,
+        error,
+      });
+      return false;
+    }
+  }
+
+  get warmStartWaitingCount(): number {
+    let count = 0;
+    for (const runners of this.waitingRunners.values()) {
+      count += runners.length;
+    }
+    return count;
   }
 
   notifyRun({ run }: { run: { friendlyId: string } }) {

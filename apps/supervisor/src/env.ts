@@ -48,6 +48,9 @@ const Env = z.object({
 
   // Optional services
   TRIGGER_WARM_START_URL: z.string().optional(),
+  TRIGGER_WARM_START_ENABLED: BoolEnv.default(false), // Enable embedded warm start (no external service needed)
+  TRIGGER_WARM_START_CONNECTION_TIMEOUT_MS: z.coerce.number().default(30_000),
+  TRIGGER_WARM_START_KEEPALIVE_MS: z.coerce.number().default(300_000),
   TRIGGER_CHECKPOINT_URL: z.string().optional(),
   TRIGGER_METADATA_URL: z.string().optional(),
 

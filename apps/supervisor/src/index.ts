@@ -44,6 +44,7 @@ class ManagedSupervisor {
 
   private readonly isKubernetes = isKubernetesEnvironment(env.KUBERNETES_FORCE_ENABLED);
   private readonly warmStartUrl = env.TRIGGER_WARM_START_URL;
+  private readonly embeddedWarmStart: boolean;
 
   constructor() {
     const { TRIGGER_WORKER_TOKEN, MANAGED_WORKER_SECRET, ...envWithoutSecrets } = env;
@@ -52,8 +53,26 @@ class ManagedSupervisor {
       this.logger.debug("Starting up", { envWithoutSecrets });
     }
 
-    if (this.warmStartUrl) {
-      this.logger.log("🔥 Warm starts enabled", {
+    // Determine warm start mode:
+    // 1. External URL set → use external service (existing behavior)
+    // 2. TRIGGER_WARM_START_ENABLED=true, no external URL → embedded matchmaking
+    // 3. Neither → warm starts disabled
+    this.embeddedWarmStart = env.TRIGGER_WARM_START_ENABLED && !this.warmStartUrl;
+
+    let effectiveWarmStartUrl = this.warmStartUrl;
+
+    if (this.embeddedWarmStart) {
+      // Auto-construct the warm start URL pointing to the workload server itself
+      const domain = env.TRIGGER_WORKLOAD_API_DOMAIN ?? "localhost";
+      effectiveWarmStartUrl = `${env.TRIGGER_WORKLOAD_API_PROTOCOL}://${domain}:${env.TRIGGER_WORKLOAD_API_PORT_EXTERNAL}`;
+
+      this.logger.log("🔥 Embedded warm starts enabled", {
+        warmStartUrl: effectiveWarmStartUrl,
+        connectionTimeoutMs: env.TRIGGER_WARM_START_CONNECTION_TIMEOUT_MS,
+        keepaliveMs: env.TRIGGER_WARM_START_KEEPALIVE_MS,
+      });
+    } else if (this.warmStartUrl) {
+      this.logger.log("🔥 Warm starts enabled (external)", {
         warmStartUrl: this.warmStartUrl,
       });
     }
@@ -62,7 +81,7 @@ class ManagedSupervisor {
       workloadApiProtocol: env.TRIGGER_WORKLOAD_API_PROTOCOL,
       workloadApiDomain: env.TRIGGER_WORKLOAD_API_DOMAIN,
       workloadApiPort: env.TRIGGER_WORKLOAD_API_PORT_EXTERNAL,
-      warmStartUrl: this.warmStartUrl,
+      warmStartUrl: effectiveWarmStartUrl,
       metadataUrl: env.TRIGGER_METADATA_URL,
       imagePullSecrets: env.KUBERNETES_IMAGE_PULL_SECRETS?.split(","),
       heartbeatIntervalSeconds: env.RUNNER_HEARTBEAT_INTERVAL_SECONDS,
@@ -296,6 +315,13 @@ class ManagedSupervisor {
       host: env.TRIGGER_WORKLOAD_API_HOST_INTERNAL,
       workerClient: this.workerSession.httpClient,
       checkpointClient: this.checkpointClient,
+      warmStart: this.embeddedWarmStart
+        ? {
+            enabled: true,
+            connectionTimeoutMs: env.TRIGGER_WARM_START_CONNECTION_TIMEOUT_MS,
+            keepaliveMs: env.TRIGGER_WARM_START_KEEPALIVE_MS,
+          }
+        : undefined,
     });
 
     this.workloadServer.on("runConnected", this.onRunConnected.bind(this));
@@ -313,6 +339,12 @@ class ManagedSupervisor {
   }
 
   private async tryWarmStart(dequeuedMessage: DequeuedMessage): Promise<boolean> {
+    // Embedded warm start: match directly in-process (no HTTP roundtrip)
+    if (this.embeddedWarmStart) {
+      return this.workloadServer.tryWarmStart(dequeuedMessage);
+    }
+
+    // External warm start service
     if (!this.warmStartUrl) {
       return false;
     }
